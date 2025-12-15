@@ -4,17 +4,29 @@ import type { NextRequest } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// --- Konstanta tombol ---
+// ====== Konstanta tombol & teks ======
 const BTN_GLOBAL = "🌍 3 Terdekat (Global)";
 const BTN_ID3    = "🇮🇩 3 Terdekat (Indonesia)";
 const BTN_IDALL  = "🇮🇩 Semua Posisi (Indonesia)";
 const BTN_LOC    = "📍 Kirim Lokasi Saya";
 
+const WELCOME = [
+  "Selamat datang di *SaTTriO* — Satelite Tracker & Intel Ops 🚀",
+  "Bot pengembangan *tracking satelit* untuk edukasi & riset.",
+  "Hubungi *Wisnu Duoglide (ET22 – STEI ITB)* untuk saran/masukan.",
+  "",
+  "• Kirim lokasi dulu untuk mengaktifkan menu.",
+  "• Setelah itu, pilih: 🌍 Global / 🇮🇩 Indonesia / 📋 Posisi Semua 🇮🇩",
+].join("\n");
+
+const FAREWELL = "Terima kasih telah menggunakan *SaTTriO*. Semoga harimu menyenangkan! ✨";
+
+// ====== Konfigurasi API Telegram ======
 const TG = process.env.TELEGRAM_BOT_TOKEN
   ? `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`
   : "";
 
-// Daftar satelit Indonesia (ringkas)
+// ====== Daftar Satelit Indonesia (ringkas) ======
 const ID_SATS: { id: number; name: string }[] = [
   { id: 65588, name: "PSN N5" },
   { id: 58995, name: "TELKOMSAT 113BT" },
@@ -27,12 +39,13 @@ const ID_SATS: { id: number; name: string }[] = [
   { id: 40931, name: "LAPAN A2" },
 ];
 
-// --- State sederhana (in-memory). Produksi: pindah ke DB/KV. ---
+// ====== State sederhana (in-memory) ======
 const lastLocation  = new Map<number, { lat: number; lon: number }>();
 const pendingAction = new Map<number, { kind: "GLOBAL3"|"ID3"|"IDALL", ts: number }>();
-const lastPromptAt  = new Map<number, number>(); // anti spam “butuh lokasi”
+const lastPromptAt  = new Map<number, number>(); // anti-spam “butuh lokasi”
+const sentByBot     = new Map<number, number[]>(); // catat message_id yang bot kirim
 
-// --- Utils keyboard ---
+// ====== Util Keyboard ======
 function keyboardAskLoc() {
   return {
     keyboard: [[{ text: BTN_LOC, request_location: true }]],
@@ -45,21 +58,72 @@ function keyboardMain() {
     resize_keyboard: true, one_time_keyboard: false,
   };
 }
-function hasLoc(chatId: number) { return lastLocation.has(chatId); }
 function ok() { return Response.json({ ok: true }); }
+function hasLoc(chatId: number) { return lastLocation.has(chatId); }
+function recordMsg(chatId: number, msgId?: number, keep = true) {
+  if (!keep || !msgId) return;
+  const arr = sentByBot.get(chatId) ?? [];
+  arr.push(msgId);
+  // batasi buffer supaya tidak membengkak
+  if (arr.length > 200) arr.splice(0, arr.length - 200);
+  sentByBot.set(chatId, arr);
+}
 
-// --- HTTP helpers ---
-async function sendMessage(chat_id: number, text: string, reply_markup?: any) {
+// ====== HTTP helpers ======
+async function sendMessage(chat_id: number, text: string, opts?: {
+  reply_markup?: any; parse_mode?: "Markdown"|"MarkdownV2"|"HTML";
+  record?: boolean; // default true
+}) {
   if (!TG) return;
-  await fetch(`${TG}/sendMessage`, {
+  const body: any = { chat_id, text, parse_mode: opts?.parse_mode ?? "Markdown" };
+  if (opts?.reply_markup) body.reply_markup = opts.reply_markup;
+  const res = await fetch(`${TG}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id, text, reply_markup }),
+    body: JSON.stringify(body),
     cache: "no-store",
+  });
+  const data = await res.json().catch(() => null);
+  const msgId: number | undefined = data?.result?.message_id;
+  recordMsg(chat_id, msgId, opts?.record !== false);
+  return msgId;
+}
+
+// Hapus keyboard dengan mengirim satu pesan yang menyertakan ReplyKeyboardRemove
+async function sendAndRemoveKeyboard(chat_id: number, text: string) {
+  return sendMessage(chat_id, text, {
+    reply_markup: { remove_keyboard: true }, // ReplyKeyboardRemove
+    parse_mode: "Markdown",
+    record: false, // pesan pamit tidak kita simpan agar tidak ikut terhapus
   });
 }
 
-// --- N2YO helpers ---
+// Delete messages (bulk bila tersedia)
+async function deleteMany(chat_id: number, ids: number[]) {
+  if (!ids.length || !TG) return;
+  // coba deleteMessages (1..100 sekaligus)
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    const res = await fetch(`${TG}/deleteMessages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id, message_ids: chunk }),
+    });
+    const ok = res.ok && (await res.json().catch(() => ({}))).ok;
+    if (!ok) {
+      // fallback: deleteMessage satuan
+      for (const mid of chunk) {
+        await fetch(`${TG}/deleteMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id, message_id: mid }),
+        });
+      }
+    }
+  }
+}
+
+// ====== N2YO helpers ======
 async function n2yoAbove(lat:number, lon:number, altM:number, radiusDeg:number, categoryId:number) {
   const key = process.env.N2YO_API_KEY!;
   const url = `https://api.n2yo.com/rest/v1/satellite/above/${lat}/${lon}/${altM}/${radiusDeg}/${categoryId}/?apiKey=${key}`;
@@ -75,7 +139,8 @@ async function n2yoPositions(id:number, lat:number, lon:number, altM:number, sec
   return res.json();
 }
 
-function toRad(d:number){return d*Math.PI/180;}
+// ====== Math & format ======
+const toRad = (d:number)=>d*Math.PI/180;
 function haversineKm(aLat:number,aLon:number,bLat:number,bLon:number){
   const R=6371, dLat=toRad(bLat-aLat), dLon=toRad(bLon-aLon);
   const la1=toRad(aLat), la2=toRad(bLat);
@@ -95,20 +160,29 @@ function flagGuess(name:string){const t=name.toUpperCase();
   return "🌐";
 }
 
-// --- Handler utama ---
-type TgMsg = { chat:{id:number}; text?:string; location?:{latitude:number; longitude:number;} };
+// ====== Types ======
+type TgLocation = { latitude:number; longitude:number };
+type TgMsg = { message_id?: number; chat:{id:number}; text?:string; location?:TgLocation };
 
+// ====== Handler ======
 export async function POST(req: NextRequest) {
   const u:any = await req.json().catch(()=>null);
   const m: TgMsg|undefined = u?.edited_message ?? u?.message;
   if (!m) return ok();
   const chatId = m.chat.id;
 
-  // Lokasi diterima
+  // simpan message_id user agar bisa dihapus saat /tutup (bila dalam 48 jam & di private chat)
+  // catatan: ini *tidak menjamin* bisa dihapus di semua konteks; biarkan API yang menentukan.
+  if (u?.message?.message_id) {
+    const arr = sentByBot.get(chatId) ?? [];
+    // kita tidak menambah message_id user ke sentByBot, karena itu khusus pesan bot.
+    // kalau ingin hapus pesan user juga, perlu daftar terpisah + pastikan konteks private chat.
+  }
+
+  // 1) Lokasi diterima
   if (m.location) {
     lastLocation.set(chatId, { lat: m.location.latitude, lon: m.location.longitude });
-    // setelah ada lokasi, tampilkan menu & jalankan aksi tertunda (jika ada)
-    await sendMessage(chatId, "Lokasi tersimpan. Silakan pilih menu.", keyboardMain());
+    await sendMessage(chatId, "Lokasi tersimpan. Pilih menu di bawah.", { reply_markup: keyboardMain() });
     const pending = pendingAction.get(chatId);
     if (pending && Date.now() - pending.ts < 5*60_000) {
       if (pending.kind === "GLOBAL3") await handleNearestGlobal(chatId);
@@ -119,47 +193,53 @@ export async function POST(req: NextRequest) {
     return ok();
   }
 
-  const text = (m.text??"").trim();
+  const text = (m.text ?? "").trim();
 
-  // /start: kalau belum ada lokasi, tampilkan tombol lokasi doang
-  if (text.startsWith("/start")) {
-    if (!hasLoc(chatId)) {
-      await sendMessage(
-        chatId,
-        "SATRIAKU siap.\nKirim lokasi dulu untuk mengaktifkan menu.",
-        keyboardAskLoc()
-      );
-      return ok();
-    }
-    await sendMessage(chatId, "Pilih menu:", keyboardMain());
+  // 2) Perintah tutup / bye / close
+  if (/^\/(tutup|bye|close)\b/i.test(text)) {
+    // hapus riwayat pesan bot (<=48 jam, per batas Bot API) lalu pamit + tutup keyboard
+    const ids = (sentByBot.get(chatId) ?? []).slice(); // copy
+    sentByBot.delete(chatId);
+    pendingAction.delete(chatId);
+    lastPromptAt.delete(chatId);
+    lastLocation.delete(chatId);
+    try { await deleteMany(chatId, ids); } catch {}
+    await sendAndRemoveKeyboard(chatId, FAREWELL);
     return ok();
   }
 
-  // Tiga tombol menu: gate by location
+  // 3) /start — tampilkan welcome + gate menu jika belum ada lokasi
+  if (text.startsWith("/start")) {
+    if (!hasLoc(chatId)) {
+      await sendMessage(chatId, WELCOME, { reply_markup: keyboardAskLoc() });
+      return ok();
+    }
+    await sendMessage(chatId, WELCOME, { reply_markup: keyboardMain() });
+    return ok();
+  }
+
+  // 4) Tekan tombol menu
   if (text === BTN_GLOBAL || text === BTN_ID3 || text === BTN_IDALL) {
     if (!hasLoc(chatId)) {
-      // Catat aksi tertunda & kirim prompt SEKALI tiap 60 detik
       const now = Date.now();
       const last = lastPromptAt.get(chatId) ?? 0;
       if (now - last > 60_000) {
-        await sendMessage(chatId, "Butuh lokasi agar bisa memproses. Tap tombol di bawah.", keyboardAskLoc());
+        await sendMessage(chatId, "Butuh lokasi agar bisa memproses. Tap tombol di bawah.", { reply_markup: keyboardAskLoc() });
         lastPromptAt.set(chatId, now);
       }
       pendingAction.set(chatId, {
         kind: text === BTN_GLOBAL ? "GLOBAL3" : text === BTN_ID3 ? "ID3" : "IDALL",
         ts: now,
       });
-      return ok(); // stop di sini; jangan loop kirim pesan lagi
+      return ok();
     }
-
-    // Sudah ada lokasi → jalankan
     if (text === BTN_GLOBAL) await handleNearestGlobal(chatId);
     if (text === BTN_ID3)    await handleNearestIndonesia(chatId);
     if (text === BTN_IDALL)  await handleAllIndonesiaPositions(chatId);
     return ok();
   }
 
-  // /near manual tetap ada
+  // 5) /near manual (tetap ada)
   if (text.startsWith("/near")) {
     const [, a, b, c, d] = text.split(/\s+/);
     const lat = Number(a), lon = Number(b);
@@ -172,33 +252,35 @@ export async function POST(req: NextRequest) {
     return ok();
   }
 
-  // Default UX: kalau belum ada lokasi → minta lokasi; kalau sudah → tampilkan menu
-  if (!hasLoc(chatId)) await sendMessage(chatId, "Kirim lokasi dulu ya.", keyboardAskLoc());
-  else await sendMessage(chatId, "Pilih menu:", keyboardMain());
+  // 6) Default UX
+  if (!hasLoc(chatId)) await sendMessage(chatId, "Kirim lokasi dulu ya.", { reply_markup: keyboardAskLoc() });
+  else await sendMessage(chatId, "Pilih menu:", { reply_markup: keyboardMain() });
   return ok();
 }
 
-// --- Aksi terpisah ---
+// ====== Aksi ======
 async function handleNearestGlobal(chatId:number){
   const loc = lastLocation.get(chatId)!;
   const data = await n2yoAbove(loc.lat, loc.lon, 0, 90, 0);
   const arr:any[] = data?.above ?? [];
-  if (!arr.length) return sendMessage(chatId, "Tidak ada objek di atas horizon saat ini.");
-  const withDist = arr.map(s=>({...s, distKm: haversineKm(loc.lat,loc.lon,s.satlat,s.satlng), flag: flagGuess(s.satname)}))
-                     .sort((a,b)=>a.distKm-b.distKm).slice(0,3);
-  const txt = withDist.map((s:any,i:number)=>`${i+1}. ${s.flag} ${s.satname} (#${s.satid})\n   d≈ ${s.distKm.toFixed(0)} km | alt ${num1(s.satalt)} km`).join("\n\n");
-  await sendMessage(chatId, `3 satelit terdekat (global):\n\n${txt}`);
+  if (!arr.length) { await sendMessage(chatId, "Tidak ada objek di atas horizon saat ini."); return; }
+  const top = arr.map(s=>({...s, distKm: haversineKm(loc.lat,loc.lon,s.satlat,s.satlng), flag: flagGuess(s.satname)}))
+                 .sort((a,b)=>a.distKm-b.distKm).slice(0,3)
+                 .map((s:any,i:number)=>`${i+1}. ${s.flag} ${s.satname} (#${s.satid})\n   d≈ ${s.distKm.toFixed(0)} km | alt ${num1(s.satalt)} km`)
+                 .join("\n\n");
+  await sendMessage(chatId, `3 satelit terdekat (global):\n\n${top}`);
 }
 async function handleNearestIndonesia(chatId:number){
   const loc = lastLocation.get(chatId)!;
   const allow=new Set(ID_SATS.map(s=>s.id));
   const data = await n2yoAbove(loc.lat, loc.lon, 0, 90, 0);
-  let list:any[] = (data?.above ?? []).filter((s:any)=>allow.has(Number(s.satid)));
-  if (!list.length) return sendMessage(chatId, "Tidak ada satelit Indonesia di atas horizon saat ini.");
-  const withDist = list.map(s=>({...s, distKm:haversineKm(loc.lat,loc.lon,s.satlat,s.satlng)}))
-                       .sort((a,b)=>a.distKm-b.distKm).slice(0,3);
-  const txt = withDist.map((s:any,i:number)=>`${i+1}. 🇮🇩 ${s.satname} (#${s.satid})\n   d≈ ${s.distKm.toFixed(0)} km | alt ${num1(s.satalt)} km`).join("\n\n");
-  await sendMessage(chatId, `3 satelit Indonesia terdekat:\n\n${txt}`);
+  const list:any[] = (data?.above ?? []).filter((s:any)=>allow.has(Number(s.satid)));
+  if (!list.length) { await sendMessage(chatId, "Tidak ada satelit Indonesia di atas horizon saat ini."); return; }
+  const top = list.map(s=>({...s, distKm: haversineKm(loc.lat,loc.lon,s.satlat,s.satlng)}))
+                  .sort((a,b)=>a.distKm-b.distKm).slice(0,3)
+                  .map((s:any,i:number)=>`${i+1}. 🇮🇩 ${s.satname} (#${s.satid})\n   d≈ ${s.distKm.toFixed(0)} km | alt ${num1(s.satalt)} km`)
+                  .join("\n\n");
+  await sendMessage(chatId, `3 satelit Indonesia terdekat:\n\n${top}`);
 }
 async function handleAllIndonesiaPositions(chatId:number){
   const loc = lastLocation.get(chatId)!;
@@ -217,7 +299,7 @@ async function handleAllIndonesiaPositions(chatId:number){
 async function handleManualNear(chatId:number, lat:number, lon:number, radius:number, category:number){
   const data = await n2yoAbove(lat, lon, 0, radius, category);
   const arr:any[] = data?.above ?? [];
-  if (!arr.length) return sendMessage(chatId, "Tidak ada objek dalam radius itu.");
+  if (!arr.length) { await sendMessage(chatId, "Tidak ada objek dalam radius itu."); return; }
   const txt = arr.slice(0,5).map((s:any,i:number)=>`${i+1}. ${s.satname} (#${s.satid})\n   lat=${num2(s.satlat)}, lon=${num2(s.satlng)}, alt=${num1(s.satalt)} km`).join("\n\n");
   await sendMessage(chatId, `Top objek di atasmu (radius ${radius}°):\n\n${txt}`);
 }
